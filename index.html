@@ -230,62 +230,215 @@
       `;
       noteInputs.insertBefore(div, noteInputs.querySelector('.bottom-row'));
       addDeleteHandler(div);
+      // wire inputs to update scheduling/visualization immediately or schedule for next loop
+      ['note-name','note-delay','note-length','note-velocity'].forEach(cls=>{
+        const inp = div.querySelector('.'+cls);
+        if (inp) inp.addEventListener('input', scheduleOrApplyUpdate);
+      });
     }
 
-    function playTone(freq, start, dur, vel=100) {
-      if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-      const now = audioCtx.currentTime;
-      const osc = audioCtx.createOscillator();
-      const g = audioCtx.createGain();
-      osc.type = 'sine'; osc.frequency.setValueAtTime(freq, now);
-      osc.connect(g); g.connect(audioCtx.destination);
-      const volume = Math.max(0, Math.min(1, vel/127));
-      g.gain.setValueAtTime(0, now+start);
-      g.gain.linearRampToValueAtTime(volume, now+start+ATTACK);
-      g.gain.setValueAtTime(volume, now+start+dur);
-      g.gain.linearRampToValueAtTime(0, now+start+dur+RELEASE);
-      osc.start(now+start);
-      osc.stop(now+start+dur+RELEASE);
-    }
-
-    function playSequence() {
+    // Build a flat list of events (offsets in seconds relative to loop start)
+    function buildSequenceEvents() {
       const measure = (+lengthInput.value)*(60/+bpmInput.value);
       const defaultVel = Math.round(Math.max(0, Math.min(127, +defaultVelocityInput.value)));
-      const channel = Math.max(0, Math.min(15, +midiChannelSelect.value));
-      const noteOn = 0x90|channel, noteOff = 0x80|channel;
-      document.querySelectorAll('.note-row').forEach(row => {
+      const events = [];
+      document.querySelectorAll('.note-row').forEach((row, rowIndex) => {
         const midi = noteToMidi(row.querySelector('.note-name').value.trim());
         if (midi==null) return;
         const delays = parseList(row.querySelector('.note-delay').value);
         const lengths = parseList(row.querySelector('.note-length').value);
         const vels    = parseList(row.querySelector('.note-velocity').value);
         delays.forEach((d,i) => {
-          const ds = d/100 * measure;
+          const offset = (d/100) * measure;
           const dur = lengths.length
             ? lengths[i%lengths.length]/1000
             : +holdInput.value/1000;
           const vel = Math.round(
-            Math.max(0, Math.min(
-              127,
-              vels.length ? vels[i%vels.length] : defaultVel
-            ))
+            Math.max(0, Math.min(127, vels.length ? vels[i%vels.length] : defaultVel))
           );
-          if (output) {
-            setTimeout(() => {
-              output.send([noteOn, midi, vel]);
-              setTimeout(()=>output.send([noteOff, midi, 0]), dur*1000);
-            }, ds*1000);
-          } else {
-            playTone(midiNoteToFreq(midi), ds, dur, vel);
-          }
+          events.push({ offset, dur, vel, midi, rowIndex });
         });
       });
+      events.sort((a,b)=>a.offset - b.offset);
+      return { events, measure };
     }
 
-    function renderNotes() {
+    // Play a tone at an absolute AudioContext time (startTime is in audioCtx.currentTime seconds)
+    function playTone(freq, startTime, dur, vel=100) {
+      if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, startTime);
+      osc.connect(g); g.connect(audioCtx.destination);
+      const volume = Math.max(0, Math.min(1, vel/127));
+      g.gain.setValueAtTime(0, startTime);
+      g.gain.linearRampToValueAtTime(volume, startTime+ATTACK);
+      g.gain.setValueAtTime(volume, startTime+dur);
+      g.gain.linearRampToValueAtTime(0, startTime+dur+RELEASE);
+      osc.start(startTime);
+      osc.stop(startTime+dur+RELEASE);
+    }
+
+    // Create a worker-driven scheduler that schedules events using AudioContext.currentTime
+    function createAudioScheduler(audioContext, sequenceEvents, opts = {}) {
+      const lookahead = opts.lookaheadMs ?? 25; // ms
+      const scheduleAheadTime = opts.scheduleAheadTime ?? 0.12; // seconds
+      const workerPath = opts.workerPath || 'scheduler-worker.js';
+      let events = sequenceEvents.events;
+      let measure = sequenceEvents.measure;
+      const onLoop = opts.onLoop;
+
+      let isRunning = false;
+      let worker = null;
+      let loopStart = 0; // audioContext time of current loop start
+      let nextEventIndex = 0;
+      let pendingSequence = null; // will be swapped in at next loop boundary
+
+      function scheduleEvent(ev, absTime) {
+        // Schedule audio
+        if (ev.midi != null) {
+          const freq = midiNoteToFreq(ev.midi);
+          playTone(freq, absTime, ev.dur, ev.vel);
+        }
+        // Schedule MIDI if output exists
+        if (output && typeof output.send === 'function') {
+          const nowAudio = audioContext.currentTime;
+          const delayMs = (absTime - nowAudio) * 1000;
+          const sendTime = performance.now() + Math.max(0, delayMs);
+          const channel = Math.max(0, Math.min(15, +midiChannelSelect.value));
+          const noteOn = 0x90 | channel;
+          const noteOff = 0x80 | channel;
+          try {
+            output.send([noteOn, ev.midi, ev.vel], sendTime);
+            output.send([noteOff, ev.midi, 0], sendTime + ev.dur*1000);
+          } catch (e) {
+            // If implementation doesn't accept timestamp, fallback to setTimeout
+            setTimeout(()=>output.send([noteOn, ev.midi, ev.vel]), delayMs);
+            setTimeout(()=>output.send([noteOff, ev.midi, 0]), delayMs + ev.dur*1000);
+          }
+        }
+      }
+
+      function applyPendingSequenceIfAny() {
+        if (pendingSequence) {
+          events = pendingSequence.events;
+          measure = pendingSequence.measure;
+          pendingSequence = null;
+          nextEventIndex = 0;
+        }
+      }
+
+      function schedulerTick() {
+        const currentTime = audioContext.currentTime;
+        // initialize loopStart when starting
+        if (!loopStart) loopStart = currentTime;
+        let nextEventTime = loopStart + (events[nextEventIndex]?.offset || 0);
+        // Schedule all events within the lookahead window
+        while (events.length && nextEventTime < currentTime + scheduleAheadTime) {
+          const ev = events[nextEventIndex];
+          const absTime = loopStart + ev.offset;
+          scheduleEvent(ev, absTime);
+          nextEventIndex++;
+          if (nextEventIndex >= events.length) {
+            // loop boundary reached
+            nextEventIndex = 0;
+            loopStart += measure;
+            // apply any pending sequence changes at loop boundary
+            applyPendingSequenceIfAny();
+            // animate progress bar and notify caller that a loop occurred
+            animateProgressBar();
+            if (typeof onLoop === 'function') onLoop();
+          }
+          nextEventTime = loopStart + (events[nextEventIndex]?.offset || 0);
+        }
+      }
+
+      function start() {
+        if (isRunning) return;
+        isRunning = true;
+        if (!audioContext) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+        // ensure audio context is running
+        if (audioContext.state === 'suspended') audioContext.resume();
+        loopStart = audioContext.currentTime;
+        nextEventIndex = 0;
+        try {
+          worker = new Worker(workerPath);
+          worker.postMessage({ command: 'start', lookahead });
+          worker.onmessage = (e) => { if (e.data && e.data.type === 'tick') schedulerTick(); };
+        } catch (err) {
+          // fallback to setInterval loop
+          function fallback() {
+            if (!isRunning) return;
+            schedulerTick();
+            setTimeout(fallback, lookahead);
+          }
+          setTimeout(fallback, lookahead);
+        }
+      }
+
+      function stop() {
+        isRunning = false;
+        if (worker) {
+          worker.postMessage({ command: 'stop' });
+          worker.terminate();
+          worker = null;
+        }
+      }
+
+      function setPendingSequence(seq) {
+        pendingSequence = seq;
+      }
+
+      return { start, stop, setPendingSequence };
+    }
+
+  // renderNotes optionally accepts a preview sequence object { events, measure }
+  // When provided, the visualization shows the given sequence (used for pending-sequence preview)
+  function renderNotes(previewSeq) {
       visualization.innerHTML = '';
-      const rows=[];
-      document.querySelectorAll('.note-row').forEach((row,i) => {
+      const rows = [];
+      const domRows = Array.from(document.querySelectorAll('.note-row'));
+
+      if (previewSeq && previewSeq.events) {
+        // Build rows using DOM row order but populate delays/lengths/vels from preview events
+        domRows.forEach((row, i) => {
+          const midi = noteToMidi(row.querySelector('.note-name').value.trim());
+          if (midi==null) return;
+          // collect events for this rowIndex
+          const evs = previewSeq.events.filter(e=>e.rowIndex === i);
+          if (evs.length) rows.push({ row, midi, evs, i });
+        });
+        if (!rows.length) return;
+        // sort rows by midi desc
+        rows.sort((a,b)=>b.midi-a.midi);
+        const slotH = visualization.clientHeight/rows.length;
+        rows.forEach(({row, evs, i}, r)=>{
+          evs.forEach((ev,j)=>{
+            const pct = (ev.offset / previewSeq.measure) * 100;
+            const x = pct/100 * visualization.clientWidth;
+            const dur = ev.dur;
+            const width = (dur/previewSeq.measure) * visualization.clientWidth;
+            const vel = ev.vel;
+            const gray = Math.round(64 + (255-64)*(vel/127));
+            const rect = document.createElement('div');
+            rect.className = 'note-rect';
+            rect.style.left = `${x}px`;
+            rect.style.top  = `${r*slotH}px`;
+            rect.style.width  = `${width}px`;
+            rect.style.height = `${slotH}px`;
+            rect.style.background = `rgb(${gray},${gray},${gray})`;
+            rect.dataset.rowIndex = i;
+            rect.dataset.idx      = j;
+            rect.addEventListener('pointerdown', startDrag);
+            visualization.append(rect);
+          });
+        });
+        return;
+      }
+
+      // default: build from DOM as before
+      domRows.forEach((row,i) => {
         const midi = noteToMidi(row.querySelector('.note-name').value.trim());
         const del  = parseList(row.querySelector('.note-delay').value);
         if (midi!=null && del.length) rows.push({row,midi,del,i});
@@ -371,8 +524,9 @@
         const delays = parseList(inp.value);
         delays[rect.dataset.idx] = parseFloat(((finalLeft/vb.width)*100).toFixed(2));
         inp.value = formatList(delays);
-        isDragging = false;
-        renderNotes();
+  isDragging = false;
+  renderNotes();
+  scheduleOrApplyUpdate();
       }
       document.addEventListener('pointermove', move);
       document.addEventListener('pointerup', up);
@@ -511,25 +665,51 @@
     aboutModal.addEventListener('click', e=>{ if(e.target===aboutModal) aboutModal.style.display='none'; });
 
     document.addEventListener('DOMContentLoaded', ()=>{
-      document.querySelectorAll('.note-row').forEach(addDeleteHandler);
+      document.querySelectorAll('.note-row').forEach(r=>{
+        addDeleteHandler(r);
+        ['note-name','note-delay','note-length','note-velocity'].forEach(cls=>{
+          const inp = r.querySelector('.'+cls);
+          if (inp) inp.addEventListener('input', scheduleOrApplyUpdate);
+        });
+      });
       renderNotes();
     });
+
+    // Worker-driven scheduler start/stop
+    let audioScheduler = null;
+    function scheduleOrApplyUpdate() {
+      // If playing, set pending sequence so it will swap at next loop boundary.
+      const seq = buildSequenceEvents();
+      if (audioScheduler && playing) {
+  audioScheduler.setPendingSequence(seq);
+  // show a preview of the pending sequence immediately so users see their edits
+  renderNotes(seq);
+      } else {
+        // not playing -> apply immediately
+        renderNotes();
+      }
+    }
 
     playButton.addEventListener('click', ()=>{
       playing = !playing;
       playButton.classList.toggle('playing', playing);
       if (playing) {
-        playSequence();
-        // always render & animate at start
+        const seq = buildSequenceEvents();
+        if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+        audioScheduler = createAudioScheduler(audioCtx, seq, {
+          workerPath: 'scheduler-worker.js',
+          lookaheadMs: 25,
+          scheduleAheadTime: 0.12,
+          onLoop: () => { 
+            // redraw visualization at loop boundary so users see the applied changes
+            if (!isDragging) renderNotes();
+          }
+        });
         renderNotes();
         animateProgressBar();
-        loopInterval = setInterval(()=>{
-          playSequence();
-          if (!isDragging) renderNotes();
-          animateProgressBar();
-        }, getLoopDuration());
+        audioScheduler.start();
       } else {
-        clearInterval(loopInterval);
+        if (audioScheduler) audioScheduler.stop();
       }
     });
 
